@@ -72,6 +72,7 @@ def main():
     ap.add_argument("input_npy", help="path to a .npy file with a 2D complex array")
     ap.add_argument("output_prefix", help="output path prefix, e.g. out/scene1 -> out/scene1_I.jp2 etc.")
     ap.add_argument("--ratio", type=float, default=20.0, help="target compression ratio per plane (default 20)")
+    ap.add_argument("--percentile", type=float, default=99.99)
     args = ap.parse_args()
 
     data = np.load(args.input_npy)
@@ -83,8 +84,8 @@ def main():
     i_plane = data.real.astype(np.float32)
     q_plane = data.imag.astype(np.float32)
 
-    i_u16, i_clip = normalize_plane_to_u16(i_plane)
-    q_u16, q_clip = normalize_plane_to_u16(q_plane)
+    i_u16, i_clip = normalize_plane_to_u16(i_plane, args.percentile)
+    q_u16, q_clip = normalize_plane_to_u16(q_plane, args.percentile)
 
     i_path = f"{args.output_prefix}_I.jp2"
     q_path = f"{args.output_prefix}_Q.jp2"

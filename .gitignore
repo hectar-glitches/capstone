@@ -1,3 +1,7 @@
 weights/
 *.pth
 __pycache__/
+.venv/
+*.tiff
+*.npy
+*.SAFE/

@@ -58,7 +58,7 @@ def quantize_block(block: np.ndarray, bits: int, clip_sigma: float = 3.0):
     return codes, step
 
 
-def baq_encode_plane(plane: np.ndarray, bits: int, block_size: int):
+def baq_encode_plane(plane: np.ndarray, bits: int, block_size: int, clip_sigma: float = 3.0):
     rows, cols = plane.shape
     n_br = (rows + block_size - 1) // block_size
     n_bc = (cols + block_size - 1) // block_size
@@ -71,7 +71,7 @@ def baq_encode_plane(plane: np.ndarray, bits: int, block_size: int):
         for bj in range(n_bc):
             c0, c1 = bj * block_size, min((bj + 1) * block_size, cols)
             block = plane[r0:r1, c0:c1]
-            block_codes, step = quantize_block(block, bits)
+            block_codes, step = quantize_block(block, bits, clip_sigma)
             codes[r0:r1, c0:c1] = block_codes
             scales[bi, bj] = step
 
@@ -104,8 +104,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input_npy", help="path to a .npy file with a 2D complex array")
     ap.add_argument("output_npz", help="path to write the quantized output")
+    ap.add_argument("--clip-sigma", type=float, default=3.0, help="quantizer clip point in block sigmas")
     ap.add_argument("--bits", type=int, default=4, help="bits per sample per plane (default 4)")
     ap.add_argument("--block-size", type=int, default=128, help="block side length in samples (default 128)")
+
     args = ap.parse_args()
 
     data = np.load(args.input_npy)
@@ -117,9 +119,8 @@ def main():
     i_plane = data.real.astype(np.float32)
     q_plane = data.imag.astype(np.float32)
 
-    i_codes, i_scales = baq_encode_plane(i_plane, args.bits, args.block_size)
-    q_codes, q_scales = baq_encode_plane(q_plane, args.bits, args.block_size)
-
+    i_codes, i_scales = baq_encode_plane(i_plane, args.bits, args.block_size, args.clip_sigma)
+    q_codes, q_scales = baq_encode_plane(q_plane, args.bits, args.block_size, args.clip_sigma)
     iq_codes = np.stack([i_codes, q_codes], axis=0)
     block_scales = np.stack([i_scales, q_scales], axis=0)
 

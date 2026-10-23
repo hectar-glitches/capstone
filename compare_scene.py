@@ -18,11 +18,10 @@ import sys
 import numpy as np
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from reps.baq import baq_decode_plane
-from reps.jp2 import denormalize_plane
-from detector.cfar import cfar_detect, cluster_detections
+from baq import baq_decode_plane
+from jp2 import denormalize_plane
+from cfar import cfar_detect, cluster_detections
 
 
 def load_raw(path):
