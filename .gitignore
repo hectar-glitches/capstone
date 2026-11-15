@@ -5,3 +5,7 @@ __pycache__/
 *.tiff
 *.npy
 *.SAFE/
+
+# downloaded datasets and labels stay local
+data/
+.DS_Store

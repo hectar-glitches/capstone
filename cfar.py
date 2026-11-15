@@ -56,19 +56,37 @@ def cfar_detect(magnitude: np.ndarray, guard: int = 2, train: int = 8, threshold
     return detections, background
 
 
-def cluster_detections(detections: np.ndarray, min_separation: int = 3):
-    """Collapse a blob of adjacent detected pixels (one bright target usually
-    lights up several neighboring pixels) into one point per connected blob,
-    at that blob's centroid. Returns a list of (row, col) centroids."""
-    from scipy.ndimage import label, center_of_mass
+def cluster_detections(detections: np.ndarray, min_separation: int = 5,
+                       min_pixels: int = 2):
+    """Collapse flagged pixels into one point per object, at its centroid.
 
-    labeled = np.empty(detections.shape, dtype=np.int32)
-    n = label(detections, output=labeled)
+    A bright target lights up several neighbouring pixels, and a smeared one
+    lights up a scatter of them spread over tens of metres, so pixels within
+    `min_separation` of each other are merged into a single object. Objects
+    smaller than `min_pixels` are then discarded: a vessel is spatially
+    extended, while a lone flagged pixel is almost always a speckle outlier
+    that happened to cross threshold.
 
-    if n == 0:
+    Counting raw connected components instead inflates every number, which is
+    how an earlier version of this analysis reported effects that are not
+    there. Returns a list of (row, col) centroids.
+    """
+    from scipy.ndimage import (label, center_of_mass, binary_dilation,
+                               generate_binary_structure, iterate_structure)
+
+    if not detections.any():
         return []
-    centroids = center_of_mass(detections, labeled, range(1, n + 1))
-    return [(float(r), float(c)) for r, c in centroids]
+    if min_separation > 0:
+        st = iterate_structure(generate_binary_structure(2, 2), min_separation)
+        labeled, n = label(binary_dilation(detections, structure=st))
+        labeled = labeled * detections
+    else:
+        labeled, n = label(detections)
+
+    ids = [i for i in range(1, n + 1) if (labeled == i).sum() >= min_pixels]
+    if not ids:
+        return []
+    return [(float(r), float(c)) for r, c in center_of_mass(detections, labeled, ids)]
 
 
 def main():

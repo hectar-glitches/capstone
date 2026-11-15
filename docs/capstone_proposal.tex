@@ -1,0 +1,248 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[hidelinks]{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{parskip}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{ragged2e}
+\usepackage{xurl}
+\newcolumntype{P}[1]{>{\RaggedRight\small}p{#1}}
+
+% Manual APA-style hanging-indent reference entry
+\newcommand{\refentry}[1]{\par\noindent\hangindent=0.4in\hangafter=1 #1\par\medskip}
+
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+
+\title{\textbf{So Much Data, So Little Space}\\\large (working title)\\\normalsize Capstone Proposal}
+\author{hectar}
+\date{September 27, 2026}
+
+\begin{document}
+\maketitle
+
+\section*{Abstract}
+\addcontentsline{toc}{section}{Abstract}
+
+Satellites like Sentinel-1 capture radar data faster than they can transmit it. Current compression methods are legacy codecs built around how easily they compress and decompress a signal. This capstone proposes having the success of a downstream task be the factor that decides how much compression a representation can tolerate, using dark-vessel detection as that task.
+
+To achieve this, we benchmark raw backscatter, classical codecs, and a learned embedding to see which can reach the most compression before downlink while a real task still succeeds on the output. A from-scratch detector flags vessels by comparing each pixel's brightness to the average brightness of the sea surface right around it. We run this detector across every representation and observe the difference in accuracy. All representations are scored against xView3-SAR, the largest labeled dark-vessel detection dataset, which supplies both the volume of labeled scenes and the detection-probability and false-alarm metric this benchmark needs.
+
+A preliminary test on a synthetic scene already shows the tradeoff this benchmark is built to measure. BAQ, about 8 times smaller than raw, keeps a quarter of detections with zero false alarms. JPEG2000, about 39 times smaller, keeps nearly two thirds of detections but adds 54 false alarms. Fall work builds the ingestion pipeline, the detector, and a spatial database joining detections against AIS to flag dark vessels.
+
+\section{Motivation}
+
+Satellites collect far more Earth observation data than they can physically send home. I saw this firsthand working at a radar-based company over the summer, where a handful of satellites generated more data than the ground segment could process, straining the company's own AWS storage bill. As a private company competing on how fast a raw capture could become a usable product, it put real engineering effort into closing that gap between measurement and processing.
+
+That gap is not unique to one company. Closing it does not just make an existing pipeline faster. It changes what kind of science and response becomes possible at all, turning a result that used to arrive too late to act on into one that arrives in time to matter. Downlink bandwidth is the real limit on how much compression alone can close that gap. Sentinel-1, for example, is limited to two X-band channels at roughly 260 Mbit/s of useful data rate each (eoPortal, n.d.), and Planet's Dove constellation can only transmit about 12 GB per ground-station pass, no matter how much it captures in orbit (Furutanpey et al., 2025).
+
+\textbf{\#purpose} --- Shrinking the gap between measurement and usable product does not just speed up one pipeline. It changes what kind of science and response becomes possible at all, which is why closing it is worth dedicated effort rather than being treated as a storage inconvenience.
+
+\textbf{\#thesis} --- This proposal benchmarks how far Sentinel-1 radar data can be compressed, raw calibrated backscatter against several classical codecs and a learned embedding, before a real detection task measurably degrades. Dark-vessel detection is the concrete task that makes that degradation measurable rather than assumed.
+
+Framed this way, the project stays agnostic about which downstream use case it ultimately serves, but a benchmark still needs one concrete task to measure detection accuracy against, so dark-vessel detection is adopted as that evaluation harness: it has a public, labeled, well-studied dataset (xView3-SAR) and a task-relevant accuracy metric (detection probability, false alarms), which makes accuracy loss from compression something to measure rather than assume. That choice does not make this a ship-detection project: the research question this project treats as its subject is ``how much can a satellite compress its data before that data stops being useful for the task it exists to serve,'' not ``how do we detect ships in radar images.'' Representation and bandwidth are the subject; dark-vessel detection is only the yardstick.
+
+Dark-vessel detection gets picked as the task for several real reasons. Illegal, unreported, and unregulated fishing costs the global fishing industry an estimated \$10 billion to \$23.5 billion a year (Agnew et al., 2009), largely because so much of it never gets reported or tracked. McDonald et al. (2021) use the same kind of AIS gap signal this project is built around to show that vessels that go dark or avoid port for long stretches are also the vessels most likely to have forced labor on board. So the dark-vessel behavior this project is trying to detect connects directly to real human harm. Paolo et al. (2024) shows a lot of that unreported fishing never shows up in AIS data either, so there's a concrete reason to go looking for ships that aren't broadcasting their location. Paolo et al. (2022) built xView3-SAR, a large set of labeled ship images, so there's already a way to check whether a detector is actually finding real ships. A real economic and human cost to care about, plus data to test against, is what makes dark-vessel detection the right task for measuring what compression does to detection.
+
+\section{Literature Review}
+
+Sentinel-1 shows this imbalance within a single satellite. While capturing imagery, it generates data faster than its downlink can send it to the ground: up to 1,280 megabits per second at its fastest, against a downlink that can only move about 520 megabits per second, under half that rate (eoPortal, n.d.). An onboard recorder holds the surplus until the satellite's next pass over a ground station, but that storage is limited too, roughly 900 gigabits, so if too much data builds up before a pass, it has to wait even longer (eoPortal, n.d.).
+
+Sentinel-1 is not a special case; the same bottleneck causes documented delays across the field, regardless of which satellite is involved. Ground-station contact windows are typically only 10 to 15 minutes long, not enough time to offload the tens of gigabytes a satellite may have captured since its last pass, so results that depend on that data lag behind capture: users of Planet's Analytics product, for instance, often wait days for results that would be far more useful the same day (Erol et al., 2025). The same pattern shows up in operational disaster response: the Copernicus Emergency Management Service's flood-mapping module, which draws on whichever satellite is tasked for a given event, delivers its first product an average of roughly 28 hours and 47 minutes after activation when that satellite has not already been pre-tasked, and roughly 16 hours even when it has; the acquisition-to-delivery step alone, the part downlink speed actually governs, still averages about 2 hours and 25 minutes in the faster case (Wania et al., 2021).
+
+Reducing data volume before transmission is already standard practice onboard. Sentinel-1's flight compression scheme, Flexible Dynamic Block Adaptive Quantization (FDBAQ), quantizes raw radar samples to a reduced bit rate chosen per acquisition mode, which on its own yields a data-volume reduction of roughly 37 to 62 percent depending on the bit rate selected; a subsequent Huffman-coding stage is then applied to that quantized output before downlink. Validated against flight-representative data at the specific bit rates used for two real test sites, the full scheme's total data-volume reduction came out to 42 percent over an Amazon rainforest site and 47 percent over a Tokyo site (Malz et al., 2012). The underlying design is documented in Attema et al. (2010) and further validated against real flight data in Guccione et al. (2015).
+
+Two standards bodies formalize compression and data quality across the field more broadly. The Consultative Committee for Space Data Systems' CCSDS-123 recommendation governs general-purpose onboard lossless data compression (Consultative Committee for Space Data Systems, 2020), with a companion report extending equivalent guidance to multispectral and hyperspectral instruments (Consultative Committee for Space Data Systems, 2022). The Committee on Earth Observation Satellites' Analysis Ready Data standard defines what a generically ``analysis-ready'' product has to look like once it reaches the ground, covering governance (Committee on Earth Observation Satellites, 2021) and, more recently, a broader strategy for adoption across the field (Committee on Earth Observation Satellites, 2024). None of these standards specifies a required level of detection accuracy for any particular downstream task; compression efficiency and data completeness are the variables they govern, not whether a task performed on the compressed output still succeeds.
+
+Compression research has also moved past hand-engineered rules like FDBAQ toward models that learn the compression scheme directly from data. Mohammadi Asiyabi et al. (2025) train a fully complex-valued autoencoder on raw radar samples and report a 4 to 6 decibel improvement in signal-to-quantization-noise ratio (SQNR) over BAQ, and 1 to 2 decibels over JPEG2000, translating to roughly a 42 percent bitrate reduction against BAQ at a matched quality target. The paper also tracks phase error directly as its own metric, since phase is critical for the focusing and interferometric processing that happen downstream of raw data. Building such a model from nothing is not the only option. A growing set of pretrained foundation models, trained once on millions of satellite scenes across sensors, can instead be adapted to a new sensor or task cheaply, an approach Danish et al. (2025) demonstrate with TerraFM, a model pretrained jointly on radar and optical imagery from Sentinel-1 and Sentinel-2. Adapting a model like that without retraining it in full is usually done through low-rank adaptation, a technique introduced by Hu et al. (2021) that fine-tunes a small added set of parameters while leaving the pretrained weights untouched, and one Li et al. (2026) apply specifically to geospatial foundation models. These two stages of the pipeline do not always line up, though. TerraFM is pretrained on already-focused backscatter rather than the raw complex samples Mohammadi Asiyabi et al. (2025)'s autoencoder and FDBAQ both operate on, a gap worth keeping in mind when comparing a foundation-model representation against either one.
+
+A newer line of work evaluates compression differently: instead of scoring a compressed representation by how closely it reconstructs the original signal, it measures whether a downstream task still succeeds on the compressed output. Chrabot (2026) runs this kind of test against Sentinel-1 stripmap data, benchmarking three classical compression codecs, Block Adaptive Quantization, High Efficiency Video Coding (HEVC), and JPEG2000, at multiple operating points, and scoring each one by detection probability and false-alarm count rather than a reconstruction-quality score such as the peak signal-to-noise ratio (PSNR) or the structural similarity index (SSIM). Its central finding is that codecs matched on compression ratio can diverge sharply in how well a detector performs on their output, so a compression ratio that looks acceptable on paper does not guarantee what a reconstruction-quality score is meant to approximate. Molli\`ere et al. (2025) report the same divergence running an equivalent test in the optical domain, scoring learned codecs against a segmentation task rather than a classical codec against a detection task.
+
+A separate body of work builds monitoring systems on top of radar data that has already been captured and processed, rather than addressing compression itself. Darpan and Lal (2026) describe a multi-agent maritime domain awareness framework that reasons over already-fused radar, weather, and AIS data using a large language model agent layer, treating the detector, the data-fusion step, and the benchmark it runs against as already in place. Paolo et al. (2022) instead supply xView3-SAR, a large labeled radar dataset built specifically for dark-vessel detection, together with a detection baseline, functioning as a benchmark resource for the field rather than a compression method in itself.
+
+Chrabot (2026) already scores compression by counting how many ships still get found and how many false alarms show up, which means Chrabot already treats whether a downstream task still works as the thing worth measuring. But Chrabot only tests classical codecs, BAQ, HEVC, and JPEG2000. Molli\`ere et al. (2025) does something similar, scoring a learned codec by whether it still finds object outlines. But that test runs on optical images, a different setup from radar ship detection. The gap is running that kind of test on a learned radar representation for ship detection, which is exactly what this project does.
+
+\section{Capstone Research Question}
+
+The Literature Review closes with a gap. No published study has run a task-based, bandwidth-grounded test for a learned Synthetic Aperture Radar (SAR) representation against a real detection task, and this project turns that gap into a single testable question:
+
+\textbf{How much can raw SAR data be compressed, and by which representation, before the loss degrades dark-vessel detection accuracy below a useful threshold?}
+
+The same radar scene can be represented several ways: raw calibrated backscatter, several classical compression codecs (BAQ, HEVC, JPEG2000) at varying bitrates, or a learned embedding. This project measures which representation should actually make the trip through a bandwidth-constrained downlink, judged on three axes: size (bits per sample), transmission time (at a realistic downlink rate), and detection accuracy (probability of detection and false-alarm count against xView3-SAR labels). Detections are stored in a spatial database (PostgreSQL + PostGIS) built to cross-reference them against AIS broadcasts, which both validates detector output against a second, independent signal and is the concrete downstream use the compression question is ultimately in service of.
+
+\section{Planned Deliverables}
+
+Answering that question end to end takes five working pieces, each one a deliverable in its own right:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{A representation/compression benchmark harness.} Ingests Sentinel-1 SLC/GRD scenes (via Copernicus Data Space or Alaska Satellite Facility Vertex), produces raw, classically compressed (BAQ, HEVC, JPEG2000 at several bitrates), and LoRA-fine-tuned embedding representations (via TerraFM) at several output sizes of the same scenes, and reports size, transmission time at a realistic downlink rate, and detection accuracy for each.
+\item \textbf{A CFAR ship/dark-vessel detector}, built from scratch against sea-clutter statistics, run against every representation above so detection accuracy is measured end to end rather than assumed from compression ratio alone. A pretrained baseline (ESA SNAP, or a model trained on SSDD/HRSID) is the week-one fallback so the benchmark has real output while the from-scratch detector is developed in parallel.
+\item \textbf{A spatial database and join engine} (PostgreSQL + PostGIS), storing detections and cross-referencing them against AIS broadcasts (Global Fishing Watch API or NOAA MarineCadastre) to flag unmatched, dark-vessel candidates and to validate detector output against an independent signal.
+\item \textbf{A lightweight serving layer}: an API plus a map dashboard showing flagged events over time, filterable by representation used, confidence, and AIS-match status.
+\item \textbf{The evaluation report itself}: the compression-cliff-style finding, at what bitrate and by which representation detection accuracy degrades below a useful threshold, is the empirical result the whole project is built to produce.
+\end{enumerate}
+
+Fall-semester scope covers items 1 to 3 at a preliminary level (one AOI, a working ingestion pipeline, a baseline detector producing real output, and the database schema designed and populated); the full benchmark sweep, the from-scratch detector's tuning, and the serving layer are Spring-semester work, consistent with the 40/60 Fall/Spring grade split.
+
+\section{Methodology and Key Variables}
+
+Building the benchmark harness and detector described above still leaves open exactly what gets held fixed, what gets varied, and what counts as a result. The methodology follows the task-based evaluation design of Chrabot (2026): hold the scene fixed, vary the representation, and measure detection outcomes directly rather than a reconstruction-quality proxy.
+
+\textbf{Representation type and its operating-point variables.} The primary factor compared in this study is representation type: raw calibrated backscatter, BAQ, HEVC, JPEG2000 in both raw and focused domains, and a learned embedding produced by LoRA fine-tuning TerraFM (Danish et al., 2025), a pretrained Sentinel-1/Sentinel-2 foundation model, on the same scenes, following the stage-wise LoRA approach of Li et al. (2026). Each representation type carries its own operating-point variable, the actual value that controls its size. BAQ sweeps bit depth, HEVC sweeps its quantization parameter, JPEG2000 sweeps bitrate, and the learned embedding sweeps output dimensionality and quantization bit depth, the same way the classical codecs are swept. That sweep is what produces a size-versus-accuracy curve for every representation type, applied to the same set of source scenes so the curves can be compared directly against each other.
+
+\textbf{Dependent variables, per representation:}
+\begin{enumerate}[label=(\roman*), leftmargin=*]
+\item Bits per complex sample (size)
+\item Transmission time at a fixed, realistic downlink rate (derived from published Sentinel-1 downlink specs; eoPortal, n.d.)
+\item Detection probability (recall against xView3-SAR labels)
+\item False alarm count
+\item AIS-match rate (fraction of detections that reconcile against an AIS broadcast within a distance/time tolerance, versus flagged as dark)
+\end{enumerate}
+
+\textbf{Detector.} A CFAR detector is implemented against sea-clutter statistics and evaluated identically across every representation, so a change in detection accuracy is attributable to the representation, not to swapping detectors. A pretrained baseline detector (SNAP, or a model trained on SSDD/HRSID) provides a week-one sanity check and a secondary point of comparison.
+
+\textbf{Secondary analysis: adaptation capacity.} As a stretch goal beyond the core benchmark, LoRA rank is varied at a fixed embedding size to test whether a higher-capacity adaptation produces an embedding that holds up better once compressed. This is a question about adaptation quality rather than about compression itself, so it is reported separately from the main size-versus-accuracy comparison rather than folded into it.
+
+\textbf{Validation.} Detector output is cross-checked in two ways: against the xView3-SAR ground-truth labels directly, and against AIS broadcasts through the spatial join, following the streaming/entity-resolution join pattern described in the project's own direction planning (spatial index via H3, track interpolation, distance/uncertainty-ellipse matching).
+
+\textbf{Threats to validity.} A single AOI's clutter statistics may not generalize; the learned embedding's training data and the evaluation scenes must be kept disjoint to avoid leakage; AIS coverage gaps produce false ``dark vessel'' flags unrelated to compression, so the AIS-match rate is reported per representation but not treated as ground truth on its own. TerraFM is pretrained on processed VV/VH backscatter rather than raw complex samples, so the learned-embedding condition is evaluated one processing step downstream of where BAQ, HEVC, and JPEG2000 operate; this mismatch is reported explicitly rather than treated as equivalent to a true raw-to-raw comparison.
+
+\section{Traceability Analysis}
+
+Each variable and deliverable above traces back to a specific requirement, so the table below follows NASA's systems-engineering traceability convention to make that link explicit rather than implicit. Verification Method follows the standard Test / Analysis / Inspection / Demonstration (TAID) categories: Test = empirical measurement against a benchmark; Analysis = calculation or comparison against a reference; Inspection = checklist/criteria review; Demonstration = showing the system performs as intended under representative conditions.
+
+\begin{longtable}{@{}P{0.04\textwidth}P{0.235\textwidth}P{0.13\textwidth}P{0.135\textwidth}P{0.085\textwidth}P{0.195\textwidth}P{0.08\textwidth}@{}}
+\toprule
+\textbf{ID} & \textbf{Requirement Statement} & \textbf{Source} & \textbf{Method} & \textbf{Level} & \textbf{Evidence / Deliverable} & \textbf{Status} \\
+\midrule
+\endhead
+Req-01 & The system shall detect vessel-like radar returns in Sentinel-1 SAR imagery over the designated study region, using a custom CFAR detector. & Track brief (satellite-data depth requirement); core research question & Test & Component & Detector precision/recall measured against xView3-SAR (SARFish) dev/validation labels & Planned \\
+Req-02 & The system shall cross-reference SAR-detected vessels against AIS broadcasts to identify candidate dark vessels. & Core research question; Paolo et al.\ (2024) precedent & Analysis & Integration & Flagged dark-vessel event log, cross-checked against Chinacalle-Mart\'inez et al.'s (2024) AIS-based Gal\'apagos findings & Planned \\
+Req-03 & The dark-vessel determination shall require sustained AIS absence across multiple satellite passes, or deviation from a vessel's own historical reporting baseline, rather than a single missed broadcast. & Methodological refinement; satellite-AIS message-collision literature & Analysis & Component & Documented decision rule with a sensitivity check against published collision-rate statistics & Design decided \\
+Req-04 & The system shall benchmark at least three representations of the same SAR data (raw calibrated, classically compressed, learned embedding) against storage size, transmission bandwidth, and detection accuracy. & Core systems research question; gap analysis (CCSDS/FDBAQ/learned-compression literature) & Test & System & Comparative benchmark table and an accuracy-vs-compression tradeoff curve & Planned \\
+Req-05 & Ingested satellite data shall be assessed against CEOS Analysis Ready Data (ARD) criteria for radiometric, geometric, and metadata completeness. & Field data-quality standard (CEOS-ARD) & Inspection & Component & Documented ARD-compliance checklist per ingested scene & Planned \\
+Req-06 & The detection-and-fusion pipeline shall be validated against a known published result before being applied to a novel study region. & Methodological rigor; false-positive risk mitigation & Demonstration & System & Pipeline output compared against Chinacalle-Mart\'inez et al.'s (2024) Gal\'apagos boundary findings & Planned \\
+Req-07 & The system shall be evaluated on a second, less-studied region to support a genuinely novel claim distinct from existing published work. & Novelty requirement; differentiation from Paolo et al.\ (2022, 2024) & Test & System & Detection and dark-vessel results for the second region, compared explicitly against the Req-06 baseline & Pending region selection \\
+Req-08 & As a stretch goal, the system shall compare detection accuracy at a fixed learned-embedding size across multiple LoRA adaptation ranks, to test whether adaptation capacity affects how well the embedding holds up once compressed. & Secondary analysis; stage-wise LoRA methodology (Li et al., 2026) & Test & Component & LoRA-rank-vs-accuracy comparison at a fixed embedding size & Stretch goal (optional) \\
+\bottomrule
+\end{longtable}
+
+\section{Timeline}
+
+Turning the seven traceable requirements above into working software over two semesters means splitting them by what is achievable now versus what depends on groundwork done first: Fall covers proposal, lit review, and preliminary data work (40\% of grade); Spring covers the full benchmark, tuned detector, and serving layer (60\%).
+
+\begin{longtable}{@{}P{0.12\textwidth}P{0.82\textwidth}@{}}
+\toprule
+\textbf{Week} & \textbf{Fall milestone} \\
+\midrule
+\endhead
+1--2 & Confirm Copernicus Data Space and Global Fishing Watch/NOAA MarineCadastre API access; pull first Sentinel-1 scenes for the AOI \\
+3 & Baseline (pretrained) detector producing real output on at least one scene; xView3-SAR labels downloaded and verified \\
+4 & Proposal due: motivation, lit review, RQ, methodology, traceability, timeline, PLO/HC/LO appendix \\
+5--6 & PostgreSQL + PostGIS schema designed and populated with baseline-detector output; first classical-codec representations (BAQ, one JPEG2000 setting) generated \\
+7 & Fall Committee Meeting: demo baseline detector + database + at least one compression comparison point \\
+8--10 & Expand codec sweep (HEVC, more JPEG2000 operating points); begin from-scratch CFAR detector development in parallel \\
+11 & Rough draft due: preliminary benchmark results across at least raw + 2 classical codecs \\
+12--13 & AIS join engine (H3 index, interpolation, matching); refine CFAR detector against baseline \\
+14 & Fall video \\
+15 & Fall oral defense \\
+\bottomrule
+\end{longtable}
+
+Spring: learned-embedding representation, full benchmark sweep across all representations, serving layer (API + dashboard), and the final evaluation report.
+
+\section{PLO/HC/LO Appendix}
+
+Beyond the systems-research content above, the proposal also has to show where this project's reasoning comes from in Minerva's own terms: at least 10 HCs, 5 LOs (2+ per college), and 3 PLOs (1+ per college), each with 2--4 sentences on a good application and its specific tie to this capstone.
+
+\subsection*{LOs (2 confirmed for Natural Sciences; Computational Sciences still needed)}
+
+\textbf{\#ns156remotesensing} --- A good application uses the physical mechanism of a remote-sensing instrument to justify a data-processing choice, not just to describe the instrument. This capstone applies it directly: the compression comparison is only meaningful because it is grounded in what SAR backscatter, phase, and polarization actually measure, and in why raw calibrated backscatter is the starting representation before any codec touches it.
+
+\textbf{\#ns125litreview} --- A good application synthesizes multiple sources into a claim the student can defend, rather than summarizing them individually. This capstone applies it in the gap analysis: reading FDBAQ, CCSDS-123, CEOS-ARD, and the task-based compression evaluation literature together to support a single claim, that compression ratio and task accuracy are separate axes, that no single source states on its own.
+
+\textbf{\#ns125fruitfuldirections} --- A good application takes an existing paper's finding and proposes a genuinely new extension of it, not a restatement. This capstone applies it by taking arXiv:2608.17269's classical-codec result and extending it to a representation that paper does not test, a learned embedding, plus tying detection output into a spatial/AIS validation step the original paper does not attempt.
+
+\textit{Needs your input:} at least 2 LOs from your Computational Sciences courses (CS110--CS166). Paste the specific 2--3 you want and they can be filled in here.
+
+\subsection*{HCs (draft list, needs your verification against the master LO list)}
+
+Draft set of commonly-cited Habits of Mind/Foundational Concepts that plausibly fit this project's reasoning, pending verification: signal-vs-noise thinking, hypothesis testing, Occam's razor, trade-off analysis, levers, causation vs.\ correlation, and metaphor/abstraction.
+
+\textit{Needs your input:} confirm the exact HC codes and supply enough to reach 10 total.
+
+\subsection*{PLOs (needs your input)}
+
+Requirement is 3 PLOs, at least 1 per college (Computational Sciences and Natural Sciences). Paste the relevant PLOs for your two colleges and the application paragraphs can be written the same way as the LOs above.
+
+\section{Second Reader Suggestions}
+
+This project would benefit most from a second reader in one of three areas:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Remote sensing / SAR or geophysics background} --- useful for stress-testing the physical claims in the motivation and lit review (calibration, polarization, phase, the FDBAQ/CCSDS material) and for judging whether the compression-vs-detection framing holds up against domain expectations.
+\item \textbf{Databases or distributed systems background} --- useful for the spatial database, join engine, and query design work, which is this project's clearest systems contribution and the part most likely to get real scrutiny on schema and indexing choices.
+\item \textbf{Applied ML/statistics background} --- useful for the learned-embedding representation and for keeping the detection-accuracy evaluation methodology (detection probability, false alarms, train/test leakage) rigorous.
+\end{enumerate}
+
+\textit{Needs your input:} name the 3 actual professors you're considering and 1--2 sentence justifications can be drafted for each against this project specifically.
+
+\section{Feedback Requested}
+
+We'd like feedback on two things. First, whether the single-AOI scope for fall, the Savannah, GA approach channel, is enough on its own, or whether the second, less-studied region the traceability table lists as pending needs to start now to stay feasible by spring.
+
+Second, the dark-vessel decision rule requires either sustained AIS absence across multiple satellite passes, or a deviation from a vessel's own historical reporting baseline, before flagging it as dark. A single missed broadcast isn't enough on its own, since AIS messages can collide and drop out from ordinary coverage gaps in busy traffic even when a vessel's transponder is still on. We'd want feedback on whether the two thresholds in that rule, how many missed passes count as ``sustained'' and how far a vessel has to drift from its own baseline to count as a deviation, are set right, and whether checking them against published AIS collision-rate statistics is enough to defend that choice, or whether it needs to be tuned empirically against real traffic in the Savannah AOI first.
+
+\section*{References}
+\addcontentsline{toc}{section}{References}
+
+\refentry{Agnew, D. J., Pearce, J., Pramod, G., Peatman, T., Watson, R., Beddington, J. R., \& Pitcher, T. J. (2009). Estimating the worldwide extent of illegal fishing. \textit{PLoS ONE, 4}(2), Article e4570. \url{https://doi.org/10.1371/journal.pone.0004570}}
+
+\refentry{Attema, E., Cafforio, C., Gottwald, M., Guccione, P., Monti Guarnieri, A., Rocca, F., \& Snoeij, P. (2010). Flexible dynamic block adaptive quantization for Sentinel-1 SAR missions. \textit{IEEE Geoscience and Remote Sensing Letters, 7}(4), 766--770. \url{https://doi.org/10.1109/lgrs.2010.2047242}}
+
+\refentry{Chinacalle-Mart\'inez, N., Hearn, A. R., Boerder, K., Murillo Posada, J. C., L\'opez-Mac\'ias, J., \& Pe\~naherrera-Palma, C. R. (2024). Fishing effort dynamics around the Gal\'apagos Marine Reserve as depicted by AIS data. \textit{PLOS ONE, 19}(4), Article e0282374. \url{https://doi.org/10.1371/journal.pone.0282374}}
+
+\refentry{Chrabot, E. M. (2026). Task-based evaluation of raw radar data compression: A pre-registered study of where classical codecs fail to preserve target detection, and why. \textit{arXiv}. \url{https://arxiv.org/abs/2608.17269}}
+
+\refentry{Committee on Earth Observation Satellites. (2021). \textit{CEOS Analysis Ready Data governance framework}. \url{https://ceos.org/ard/files/CEOS_ARD_Governance_Framework_18-October-2021.pdf}}
+
+\refentry{Committee on Earth Observation Satellites. (2024). \textit{CEOS Analysis Ready Data strategy 2024}. \url{https://ceos.org/ard/files/CEOS\%20Analysis\%20Ready\%20Data\%20Strategy\%202024\%20October\%202024.pdf}}
+
+\refentry{Consultative Committee for Space Data Systems. (2020). \textit{Lossless data compression} (Recommendation for Space Data System Standards, CCSDS 121.0-B-3). \url{https://ccsds.org/Pubs/121x0b3.pdf}}
+
+\refentry{Consultative Committee for Space Data Systems. (2022). \textit{Low-complexity lossless and near-lossless multispectral and hyperspectral compression} (Informational Report, CCSDS 120.2-G-2). \url{https://ccsds.org/Pubs/120x2g2.pdf}}
+
+\refentry{Danish, M. S., Munir, M. A., Shah, S. R. A., Khan, M. H., Anwer, R. M., Laaksonen, J., Khan, F. S., \& Khan, S. (2025). TerraFM: A scalable foundation model for unified multisensor Earth observation. \textit{arXiv}. \url{https://arxiv.org/abs/2506.06281}}
+
+\refentry{Darpan, T., \& Lal, H. (2026). An AI based multi-agent framework for maritime domain awareness using SAR imagery, weather intelligence and retrieval augmented reasoning: A coastal surveillance case study. \textit{International Journal of Engineering Research \& Technology, 15}(6). \url{https://www.ijert.org/an-ai-based-multi-agent-framework-for-maritime-domain-awareness-using-sar-imagery-weather-intelligence-and-retrieval-augmented-reasoning-a-coastal-surveillance-case-study-ijertv15is061264}}
+
+\refentry{Furutanpey, A., Zhang, Q., Raith, P., Pfandzelter, T., Wang, S., \& Dustdar, S. (2025). FOOL: Addressing the downlink bottleneck in satellite computing with neural feature compression. \textit{IEEE Transactions on Mobile Computing, 24}(8), 6747--6764.}
+
+\refentry{eoPortal. (n.d.). \textit{Copernicus: Sentinel-1}. European Space Agency. Retrieved September 27, 2026, from \url{https://www.eoportal.org/satellite-missions/copernicus-sentinel-1}}
+
+\refentry{Erol, A. K., Lee, S., \& Mahajan, D. (2025). EarthSight: A distributed framework for low-latency satellite intelligence. \textit{arXiv}. \url{https://arxiv.org/abs/2511.10834}}
+
+\refentry{Guccione, P., Belotti, M., Giudici, D., Monti Guarnieri, A., \& Navas-Traver, I. (2015). Sentinel-1A: Analysis of FDBAQ performance on real data. \textit{IEEE Transactions on Geoscience and Remote Sensing, 53}(12), 6804--6812. \url{https://doi.org/10.1109/tgrs.2015.2449288}}
+
+\refentry{Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., \& Chen, W. (2021). LoRA: Low-rank adaptation of large language models. \textit{arXiv}. \url{https://arxiv.org/abs/2106.09685}}
+
+\refentry{Li, X., Caraballo-Vega, J. A., Gong, J., Carroll, M. L., \& Wang, J. (2026). SPECTRA: Band-routed embedding and stage-wise LoRA for cross-sensor fine-tuning of geospatial foundation models. In \textit{Proceedings of the 34th ACM International Conference on Advances in Geographic Information Systems (SIGSPATIAL '26)}. \url{https://arxiv.org/abs/2608.01751}}
+
+\refentry{Malz, E., Scheiber, R., Mittermayer, J., Snoeij, P., \& Attema, E. (2012). Sentinel-1 FDBAQ performance validation using TerraSAR-X data. In \textit{2012 IEEE International Geoscience and Remote Sensing Symposium} (pp. 1--4). IEEE. \url{https://doi.org/10.1109/igarss.2012.6351216}}
+
+\refentry{McDonald, G. G., Costello, C., Bone, J., Cabral, R. B., Farabee, V., Hochberg, T., Kroodsma, D., Mangin, T., Meng, K. C., \& Zahn, O. (2021). Satellites can reveal global extent of forced labor in the world's fishing fleet. \textit{Proceedings of the National Academy of Sciences, 118}(3), Article e2016238117. \url{https://doi.org/10.1073/pnas.2016238117}}
+
+\refentry{Mohammadi Asiyabi, R., Datcu, M., Anghel, A., Focsa, A., Martone, M., Rizzoli, P., \& Imbembo, E. (2025). Complex-valued autoencoder-based neural data compression for SAR raw data. \textit{IEEE Journal of Selected Topics in Signal Processing, 19}(3). \url{https://elib.dlr.de/211936/}}
+
+\refentry{Molli\`ere, C., Liesenhoff, L., Cumplido, I., Schubert, M., Zeulner, M., \& Gottfriedsen, J. (2025). Learned image compression for Earth observation: Implications for downstream segmentation tasks. \textit{arXiv}. \url{https://arxiv.org/abs/2512.01788}}
+
+\refentry{Paolo, F., Lin, T.-t. T., Gupta, R., Goodman, B., Patel, N., Kuster, D., Kroodsma, D., \& Dunnmon, J. (2022). xView3-SAR: Detecting dark fishing activity using synthetic aperture radar imagery. \textit{arXiv}. \url{https://arxiv.org/abs/2206.00897}}
+
+\refentry{Paolo, F. S., Kroodsma, D., Raynor, J., Hochberg, T., Davis, P., Cleary, J., Marsaglia, L., Orofino, S., Thomas, C., \& Halpin, P. (2024). Satellite mapping reveals extensive industrial activity at sea. \textit{Nature, 625}(7993), 85--91. \url{https://doi.org/10.1038/s41586-023-06825-8}}
+
+\refentry{Wania, A., Joubert-Boitat, I., Dottori, F., Kalas, M., \& Salamon, P. (2021). Increasing timeliness of satellite-based flood mapping using early warning systems in the Copernicus Emergency Management Service. \textit{Remote Sensing, 13}(11), Article 2114. \url{https://doi.org/10.3390/rs13112114}}
+
+\end{document}
