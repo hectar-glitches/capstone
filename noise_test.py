@@ -16,6 +16,10 @@ what the contrast actually does, and count which vessels survive.
     python3 noise_test.py scene.npy --labels vessels.csv --trials 50
     python3 noise_test.py chip_ships.npy --sqnr 28 13.4 9.8 3.2
 
+    # scene mode: every labelled vessel in a .SAFE.zip, one window each
+    python3 noise_test.py product.SAFE.zip --labels SLC_validation.csv \
+        --swath IW3 --pol vh --out iw3_vh.csv
+
 WHAT THIS DOES AND DOES NOT MODEL
 
 The noise added here is white and uniform, which is what the model assumes.
@@ -26,6 +30,16 @@ So this experiment is the model's best case. Running real FDBAQ later and
 differencing the two measurements is how the halo gets quantified.
 
 Reference vessels come from the uncompressed run unless --labels is given.
+
+SCENE MODE
+
+Given a .SAFE.zip and a SARFish label file, the script reads a small window
+around each labelled vessel straight out of the zip, skips windows with land
+or missing data in them, and runs the same test per vessel. A vessel counts
+as detectable if the detector finds it in the uncompressed window; detection
+at each setting is then reported as the share of runs in which it is still
+found. Loss is only meaningful for detectable vessels, since compression
+cannot lose a vessel the detector never saw.
 """
 import argparse
 import csv
@@ -139,14 +153,163 @@ predicted_loss_db = lambda sqnr_db: 10 * np.log10(1 + 10 ** (-sqnr_db / 10))
 
 # --------------------------------------------------------------------- main
 
+# --------------------------------------------------------------- scene mode
+
+def run_scene(args):
+    """Per-vessel test over every labelled object in one swath of a .SAFE.zip."""
+    import rasterio
+    from rasterio.windows import Window
+    from survey import from_zip
+
+    if not args.labels:
+        sys.exit("scene mode needs --labels")
+    path, _ = from_zip(args.chip, args.swath, args.pol)
+    prod = args.product or os.path.basename(args.chip).split(".SAFE")[0]
+    sw = args.swath.upper().replace("IW", "")
+
+    with open(args.labels) as f:
+        here = [d for d in csv.DictReader(f)
+                if d["SLC_product_identifier"] == prod and d["swath_index"] == sw]
+    labs = [d for d in here if not args.vessels_only or d["is_vessel"] == "True"]
+    # every labelled object in the swath, vessel or not, so that neighbours
+    # can be masked out of each window's sea statistics
+    allpos = np.array([(float(d["detect_scene_row"]), float(d["detect_scene_column"]))
+                       for d in here]).reshape(-1, 2)
+    print(f"{prod}  swath {sw}  {args.pol.upper()}")
+    print(f"{len(labs)} labelled {'vessel' if args.vessels_only else 'object'}(s)\n")
+
+    W, h = args.window, args.window // 2
+    box = 20                                   # vessel and its sidelobes, excluded from sea stats
+    rng = np.random.default_rng(args.seed)
+    sqnrs = sorted(args.sqnr, reverse=True)
+    skipped = {"edge": 0, "nodata": 0, "land": 0, "crowded": 0}
+    out = []
+
+    with rasterio.open(path) as src:
+        for k, d in enumerate(labs):
+            R, C = float(d["detect_scene_row"]), float(d["detect_scene_column"])
+            r0, c0 = int(round(R)) - h, int(round(C)) - h
+            if r0 < 0 or c0 < 0 or r0 + W > src.height or c0 + W > src.width:
+                skipped["edge"] += 1
+                continue
+            chip = src.read(1, window=Window(c0, r0, W, W)).astype(np.complex64)
+            I = np.abs(chip) ** 2
+            # Missing data shows up as whole rows or columns of zeros (swath
+            # edges, burst gaps). Scattered zeros are not missing data: in dark
+            # cross-pol water near the noise floor, integer storage rounds 1-2%
+            # of samples to exactly zero, and rejecting those windows would
+            # discard the very water where vessels are most at risk.
+            z = I == 0
+            if z.all(axis=1).any() or z.all(axis=0).any() or z.mean() > 0.05:
+                skipped["nodata"] += 1
+                continue
+
+            # Sea statistics come from the window minus a box around every
+            # labelled object in it, the target included, so neither its own
+            # sidelobes nor a neighbouring vessel inflate the noise reference
+            # or make crowded open water look like land. CV well above 1 after
+            # that means coastline or other unlabelled strong structure.
+            m = np.ones(I.shape, bool)
+            inside = allpos[(allpos[:, 0] >= r0) & (allpos[:, 0] < r0 + W) &
+                            (allpos[:, 1] >= c0) & (allpos[:, 1] < c0 + W)]
+            for y, x in inside:
+                yy, xx = int(round(y)) - r0, int(round(x)) - c0
+                m[max(0, yy - box):yy + box + 1, max(0, xx - box):xx + box + 1] = False
+            if m.mean() < 0.5:
+                skipped["crowded"] += 1
+                continue
+            bg = I[m]
+            cv = float(bg.std() / bg.mean())
+            if cv > args.max_cv:
+                skipped["land"] += 1
+                continue
+            sea_power = float(np.median(bg)) / np.log(2)
+
+            ref = [dict(row=R - r0, col=C - c0)]
+            got = objects(chip, args.guard, args.train, args.threshold_db,
+                          args.merge, args.min_pixels)
+            det0 = match(ref, got, args.tol)[0][0]
+            rec = dict(detect_id=d["detect_id"], row=R, col=C,
+                       length_m=d["vessel_length_m"] or "", source=d["source"],
+                       is_fishing=d["is_fishing"], confidence=d["confidence"],
+                       km_from_shore=d["xView3_shoreline_distance_from_shore_km"],
+                       window_cv=round(cv, 3), neighbours=int(len(inside) - 1),
+                       contrast_db=round(contrast_db(chip, h, h, args.peak_radius,
+                                                     args.guard, args.train), 2),
+                       detected=int(det0))
+            for sq in sqnrs:
+                hits = 0
+                for _ in range(args.trials):
+                    noisy = add_noise(chip, sq, sea_power, rng)
+                    g = objects(noisy, args.guard, args.train, args.threshold_db,
+                                args.merge, args.min_pixels)
+                    hits += match(ref, g, args.tol)[0][0]
+                rec[f"det_{sq:g}"] = round(hits / args.trials, 3)
+            out.append(rec)
+            if (k + 1) % 25 == 0:
+                print(f"  {k + 1}/{len(labs)} labels processed")
+
+    print(f"\ntested {len(out)}   skipped: {skipped['edge']} at swath edge, "
+          f"{skipped['nodata']} with missing data, {skipped['land']} with land in window, "
+          f"{skipped['crowded']} too crowded to measure the sea")
+    if not out:
+        return
+
+    if args.out:
+        with open(args.out, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(out[0]))
+            w.writeheader()
+            w.writerows(out)
+        print(f"wrote {args.out}")
+
+    det = [r for r in out if r["detected"]]
+    print(f"detectable uncompressed: {len(det)} of {len(out)}\n")
+    if not det:
+        return
+
+    def summary(group, name):
+        if not group:
+            return
+        n = len(group)
+        cells = []
+        for sq in sqnrs:
+            p = float(np.mean([r[f"det_{sq:g}"] for r in group]))
+            cells.append(f"{100 * (1 - p):>6.0f}%")
+        print(f"  {name:<22} {n:>4}  " + " ".join(cells))
+
+    print("share of detectable vessels LOST, by SQNR (dB)")
+    print(f"  {'':<22} {'n':>4}  " + " ".join(f"{sq:>7g}" for sq in sqnrs))
+    summary(det, "all detectable")
+    for lo, hi in ((0, 15), (15, 30), (30, 1e9)):
+        g = [r for r in det if r["length_m"] and lo <= float(r["length_m"]) < hi]
+        summary(g, f"length {lo:g}+ m" if hi > 1e8 else f"length {lo:g}-{hi:g} m")
+    summary([r for r in det if not r["length_m"]], "length unknown")
+    summary([r for r in det if r["source"] == "manual"], "no AIS match (dark)")
+    summary([r for r in det if r["source"] != "manual"], "AIS matched")
+
+    se = lambda p, n: 100 * np.sqrt(p * (1 - p) / n)
+    p = float(np.mean([r[f"det_{sqnrs[-1]:g}"] for r in det]))
+    print(f"\nat {sqnrs[-1]:g} dB the loss among all detectable vessels has a standard "
+          f"error of about {se(p, len(det)):.0f} points, treating vessels as independent.")
+    print("They are not fully independent, since they share one scene, so read it as a floor.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("chip", help=".npy of complex samples")
+    ap.add_argument("chip", help=".npy of complex samples, or a .SAFE.zip for scene mode")
     ap.add_argument("--labels", help="SARFish SLC_validation.csv, or any CSV with "
                                      "row,col columns; default uses the uncompressed run")
     ap.add_argument("--product", help="product identifier, for a SARFish label file")
     ap.add_argument("--swath", default="IW3", help="subswath, for a SARFish label file")
+    ap.add_argument("--pol", default="vh", help="polarisation, scene mode only")
+    ap.add_argument("--window", type=int, default=256,
+                    help="scene mode: side of the window cut around each vessel")
+    ap.add_argument("--max-cv", type=float, default=1.5,
+                    help="scene mode: skip windows whose sea CV exceeds this "
+                         "(open water sits near 1.0; land pushes it well above)")
+    ap.add_argument("--all-objects", dest="vessels_only", action="store_false",
+                    help="scene mode: include labelled objects that are not vessels")
     ap.add_argument("--chip-offset", type=int, nargs=2, metavar=("ROW", "COL"),
                     help="where this chip sits in the full swath, so SARFish label "
                          "coordinates can be translated into chip coordinates")
@@ -161,14 +324,20 @@ def main():
     ap.add_argument("--threshold-db", type=float, default=13.0)
     ap.add_argument("--merge", type=int, default=5)
     ap.add_argument("--min-pixels", type=int, default=2)
-    ap.add_argument("--tol", type=float, default=25.0,
-                    help="matching radius in pixels")
+    ap.add_argument("--tol", type=float, default=None,
+                    help="matching radius in pixels (default 25, or 10 in scene "
+                         "mode where labelled vessels can sit close together)")
     ap.add_argument("--peak-radius", type=int, default=3,
                     help="half-width of the window the vessel peak is taken "
                          "from; keep small (default 3), see contrast_db")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", help="write per-vessel results to this CSV")
     args = ap.parse_args()
+
+    if args.chip.lower().endswith(".zip"):
+        args.tol = 10.0 if args.tol is None else args.tol
+        return run_scene(args)
+    args.tol = 25.0 if args.tol is None else args.tol
 
     chip = np.load(args.chip)
     if not np.iscomplexobj(chip):
