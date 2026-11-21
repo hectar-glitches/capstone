@@ -15,8 +15,19 @@ Decoding Package, pp. 78-80):
   - SF    : Sigma Factor table, indexed by Threshold Index (THIDX)
 
 Decode rule, per the spec:
-    if THIDX <= simple_threshold[BRC]:  value = sign * BRCn[THIDX]
-    else:                               value = sign * NRLn[mcode] * SF[THIDX]
+    if THIDX <= simple_threshold[BRC]:
+        value = sign * mcode                    (for mcode below the top code)
+        value = sign * BRCn[THIDX]              (for the top code)
+    else:
+        value = sign * NRLn[mcode] * SF[THIDX]
+
+Blocks run along each echo line (range direction). In the real packets a
+block is 256 complex samples, with one BRC (3 bits) and one THIDX (8 bits)
+shared by I and Q. main() follows that. The sign is part of each Huffman
+codeword, not a separate bit.
+Checked against the sentinel1decoder source (rust/src): the NRL, simple
+reconstruction and SF tables, the simple-mode rule, and the Huffman code
+lengths in HUFFMAN_LEN below. Only the code lengths are used here.
 
 IMPORTANT, and this is the interesting part for the capstone: the spec
 defines *decoding*. How an encoder picks BRC and THIDX per block is not
@@ -27,7 +38,7 @@ which is the natural clutter-driven choice and the direct analogue of
 baq.py's sigma-based clip.
 
 Usage:
-    python3 fdbaq.py input_scene.npy output_fdbaq.npz --brc 4 --block-size 128
+    python3 fdbaq.py input_scene.npy output_fdbaq.npz --brc 4 --block-size 256
     python3 fdbaq.py input_scene.npy out.npz --thidx-scale 2.0   # looser tail
 """
 import argparse
@@ -57,6 +68,18 @@ NRL = {
 
 # THIDX value at or below which the simple BRC table is used instead of NRL*SF
 SIMPLE_THIDX_MAX = {0: 3, 1: 3, 2: 5, 3: 6, 4: 8}
+
+# Huffman code length in bits for each magnitude code, per BRC. The sign is
+# inside the codeword, so these lengths already include it (both signs of a
+# magnitude have the same length).
+HUFFMAN_LEN = {
+    0: [2, 3, 4, 4],
+    1: [2, 3, 4, 5, 5],
+    2: [2, 3, 4, 5, 6, 7, 7],
+    3: [3, 3, 3, 4, 5, 6, 7, 8, 9, 9],
+    4: [3, 4, 4, 4, 4, 5, 5, 5, 6, 7, 9, 9, 10, 10, 10, 10],
+}
+HEADER_BITS_PER_BLOCK = 3 + 8   # BRC (3 bits) + THIDX (8 bits)
 
 _SF_LIST = [
     0., 0.630, 1.250, 1.880, 2.510, 3.130, 3.760, 4.390, 5.010, 5.640, 6.270, 6.890, 7.520,
@@ -88,84 +111,107 @@ _SF_LIST = [
 SF = np.array(_SF_LIST, dtype=np.float64)
 
 
-def choose_thidx(sigma: float, scale: float = 1.0) -> int:
+def choose_thidx(sigma, scale: float = 1.0):
     """Pick the Threshold Index whose Sigma Factor best matches `scale * sigma`.
 
     This is the encoder-side rate-allocation decision. The spec does not
     define it. `scale` = 1.0 is the clutter-driven default; raising it widens
     the representable range and is the FDBAQ analogue of loosening baq.py's
-    clip_sigma.
+    clip_sigma. Takes one sigma or an array of sigmas (one per block).
     """
-    target = scale * sigma
-    if target <= 0:
-        return 0
-    return int(np.argmin(np.abs(SF - target)))
+    target = np.atleast_1d(np.asarray(sigma, dtype=np.float64)) * scale
+    idx = np.abs(SF[None, :] - target[:, None]).argmin(axis=1)
+    idx = np.where(target <= 0, 0, idx)
+    return int(idx[0]) if np.ndim(sigma) == 0 else idx
 
 
-def quantize_block(block: np.ndarray, brc: int, thidx: int):
-    """Quantize one real-valued block to FDBAQ magnitude codes + signs.
+def quantize_block(block: np.ndarray, brc: int, thidx: np.ndarray):
+    """Quantize a (rows, width) slab of real samples to magnitude codes + signs.
 
-    Returns (mcodes uint8, signs int8). Reconstruction is handled by
-    dequantize_block using the same (brc, thidx).
+    `thidx` has one entry per row, because each row's stretch of `width`
+    samples is its own block. Returns (mcodes uint8, signs int8).
     """
     levels = NRL[brc]
+    top = len(levels) - 1
+    thidx = np.atleast_1d(thidx).astype(int)
     signs = np.where(block < 0, -1, 1).astype(np.int8)
     mag = np.abs(block)
 
-    if thidx <= SIMPLE_THIDX_MAX[brc]:
-        # Simple-reconstruction regime: a single magnitude per block.
-        return np.zeros(block.shape, dtype=np.uint8), signs
-
-    scaled = mag / SF[thidx]
-    # Nearest non-uniform level. Levels are sorted, so use midpoints.
+    # Simple regime (very low sigma): the code is the rounded magnitude,
+    # capped at the top code.
+    m_simple = np.minimum(np.rint(mag), top)
+    # Normal regime: nearest non-uniform level. Levels are sorted, so use midpoints.
     edges = (levels[:-1] + levels[1:]) / 2.0
-    mcodes = np.searchsorted(edges, scaled).astype(np.uint8)
-    return mcodes, signs
+    scaled = mag / np.maximum(SF[thidx], 1e-9)[:, None]
+    m_norm = np.searchsorted(edges, scaled)
+
+    simple = (thidx <= SIMPLE_THIDX_MAX[brc])[:, None]
+    return np.where(simple, m_simple, m_norm).astype(np.uint8), signs
 
 
-def dequantize_block(mcodes: np.ndarray, signs: np.ndarray, brc: int, thidx: int) -> np.ndarray:
-    if thidx <= SIMPLE_THIDX_MAX[brc]:
-        value = BRC_SIMPLE[brc][min(thidx, len(BRC_SIMPLE[brc]) - 1)]
-        return signs.astype(np.float64) * value
-    return signs.astype(np.float64) * NRL[brc][mcodes] * SF[thidx]
+def dequantize_block(mcodes: np.ndarray, signs: np.ndarray, brc: int, thidx: np.ndarray) -> np.ndarray:
+    top = len(NRL[brc]) - 1
+    thidx = np.atleast_1d(thidx).astype(int)
+    simple = (thidx <= SIMPLE_THIDX_MAX[brc])[:, None]
+
+    normal = NRL[brc][mcodes] * SF[thidx][:, None]
+    top_value = BRC_SIMPLE[brc][np.minimum(thidx, len(BRC_SIMPLE[brc]) - 1)]
+    small = np.where(mcodes == top, top_value[:, None], mcodes.astype(np.float64))
+    return signs.astype(np.float64) * np.where(simple, small, normal)
 
 
-def encode_plane(plane: np.ndarray, brc: int, block_size: int, thidx_scale: float = 1.0):
+def encode_plane(plane: np.ndarray, brc: int, block_size: int = 256, thidx_scale: float = 1.0, sigma=None):
+    """Blocks are `block_size` samples along each row (one echo line).
+
+    `sigma` is an optional (rows, n_blocks) array. Pass joint_sigma() output to
+    code I and Q with a shared THIDX, as the real packets do. If left out, this
+    plane's own sigma is used."""
     rows, cols = plane.shape
-    n_br = (rows + block_size - 1) // block_size
     n_bc = (cols + block_size - 1) // block_size
 
     mcodes = np.zeros((rows, cols), dtype=np.uint8)
     signs = np.ones((rows, cols), dtype=np.int8)
-    thidx = np.zeros((n_br, n_bc), dtype=np.uint8)
+    thidx = np.zeros((rows, n_bc), dtype=np.uint8)
 
-    for bi in range(n_br):
-        r0, r1 = bi * block_size, min((bi + 1) * block_size, rows)
-        for bj in range(n_bc):
-            c0, c1 = bj * block_size, min((bj + 1) * block_size, cols)
-            block = plane[r0:r1, c0:c1]
-            t = choose_thidx(float(block.std()), thidx_scale)
-            m, s = quantize_block(block, brc, t)
-            mcodes[r0:r1, c0:c1] = m
-            signs[r0:r1, c0:c1] = s
-            thidx[bi, bj] = t
+    for bj in range(n_bc):
+        c0, c1 = bj * block_size, min((bj + 1) * block_size, cols)
+        block = plane[:, c0:c1]
+        sig = np.sqrt((block ** 2).mean(axis=1)) if sigma is None else sigma[:, bj]
+        t = choose_thidx(sig, thidx_scale)
+        mcodes[:, c0:c1], signs[:, c0:c1] = quantize_block(block, brc, t)
+        thidx[:, bj] = t
 
     return mcodes, signs, thidx
 
 
 def decode_plane(mcodes: np.ndarray, signs: np.ndarray, thidx: np.ndarray, brc: int, block_size: int):
     rows, cols = mcodes.shape
-    n_br, n_bc = thidx.shape
     out = np.zeros((rows, cols), dtype=np.float64)
-
-    for bi in range(n_br):
-        r0, r1 = bi * block_size, min((bi + 1) * block_size, rows)
-        for bj in range(n_bc):
-            c0, c1 = bj * block_size, min((bj + 1) * block_size, cols)
-            out[r0:r1, c0:c1] = dequantize_block(
-                mcodes[r0:r1, c0:c1], signs[r0:r1, c0:c1], brc, int(thidx[bi, bj])
-            )
+    for bj in range(thidx.shape[1]):
+        c0, c1 = bj * block_size, min((bj + 1) * block_size, cols)
+        out[:, c0:c1] = dequantize_block(mcodes[:, c0:c1], signs[:, c0:c1], brc, thidx[:, bj])
     return out
+
+
+def joint_sigma(i_plane: np.ndarray, q_plane: np.ndarray, block_size: int = 256) -> np.ndarray:
+    """Per-block sigma over I and Q together, shape (rows, n_blocks)."""
+    rows, cols = i_plane.shape
+    n_bc = (cols + block_size - 1) // block_size
+    out = np.zeros((rows, n_bc))
+    for bj in range(n_bc):
+        c0, c1 = bj * block_size, min((bj + 1) * block_size, cols)
+        out[:, bj] = np.sqrt(((i_plane[:, c0:c1] ** 2).mean(axis=1) + (q_plane[:, c0:c1] ** 2).mean(axis=1)) / 2.0)
+    return out
+
+
+def huffman_bits_per_complex_sample(i_mcodes: np.ndarray, q_mcodes: np.ndarray, brc: int, block_size: int = 256) -> float:
+    """Real rate: Huffman code lengths for every I and Q sample (sign included)
+    plus the BRC and THIDX header bits once per block."""
+    lens = np.array(HUFFMAN_LEN[brc])
+    rows, cols = i_mcodes.shape
+    n_blocks = rows * ((cols + block_size - 1) // block_size)
+    bits = int(lens[i_mcodes].sum()) + int(lens[q_mcodes].sum()) + HEADER_BITS_PER_BLOCK * n_blocks
+    return bits / (rows * cols)
 
 
 def load_fdbaq_reconstruction(npz_path: str) -> np.ndarray:
@@ -194,7 +240,7 @@ def main():
     ap.add_argument("output_npz")
     ap.add_argument("--brc", type=int, default=4, choices=[0, 1, 2, 3, 4],
                     help="Bit Rate Code: 0=4 levels ... 4=16 levels (default 4)")
-    ap.add_argument("--block-size", type=int, default=128)
+    ap.add_argument("--block-size", type=int, default=256)
     ap.add_argument("--thidx-scale", type=float, default=1.0,
                     help="multiplier on block sigma when choosing THIDX (default 1.0)")
     args = ap.parse_args()
@@ -206,8 +252,9 @@ def main():
     i_plane = data.real.astype(np.float64)
     q_plane = data.imag.astype(np.float64)
 
-    i_m, i_s, i_t = encode_plane(i_plane, args.brc, args.block_size, args.thidx_scale)
-    q_m, q_s, q_t = encode_plane(q_plane, args.brc, args.block_size, args.thidx_scale)
+    sig = joint_sigma(i_plane, q_plane, args.block_size)   # I and Q share one THIDX per block
+    i_m, i_s, i_t = encode_plane(i_plane, args.brc, args.block_size, args.thidx_scale, sigma=sig)
+    q_m, q_s, q_t = encode_plane(q_plane, args.brc, args.block_size, args.thidx_scale, sigma=sig)
 
     np.savez_compressed(
         args.output_npz,
@@ -223,7 +270,9 @@ def main():
 
     print(f"input samples: {data.shape[0]}x{data.shape[1]} ({data.dtype})")
     print(f"BRC {args.brc} ({len(NRL[args.brc])} levels), block={args.block_size}, thidx_scale={args.thidx_scale}")
-    print(f"rate:      {2*bps:.2f} bits/complex sample (entropy + sign, rate-honest)")
+    huff = huffman_bits_per_complex_sample(i_m, q_m, args.brc, args.block_size)
+    print(f"rate:      {huff:.2f} bits/complex sample (Huffman code lengths + {HEADER_BITS_PER_BLOCK} header bits per block)")
+    print(f"           {2*bps:.2f} from the entropy estimate, for comparison")
     print(f"file size: {out_bytes:,} bytes  vs raw {raw_bytes:,}  ({raw_bytes/out_bytes:.2f}x)")
     print(f"max |x|:   input {np.abs(data).max():.1f}  ->  reconstructed {np.abs(recon).max():.1f}")
 
